@@ -1,0 +1,732 @@
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel, AutoTokenizer
+import numpy as np
+from tqdm import tqdm
+import pandas as pd
+import matplotlib.pyplot as plt
+import random
+from google.colab import drive
+import torch.nn.functional as F
+
+# Mount Google Drive
+drive.mount('/content/drive')
+
+# Set up paths
+BASE_PATH = '/content/drive/MyDrive/latin_model'
+MODEL_DIR = f'{BASE_PATH}/contrastive_model_enhanced'  # New directory for enhanced model
+DATA_DIR = '/content/drive/MyDrive/OHG-texts'
+
+# Create model directory if it doesn't exist
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+print(f"Enhanced model will be saved to: {MODEL_DIR}")
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Define the contrastive model with enhanced projection
+class EnhancedContrastiveModel(nn.Module):
+    def __init__(self, base_model_name='bert-base-multilingual-cased'):
+        super(EnhancedContrastiveModel, self).__init__()
+        self.bert = AutoModel.from_pretrained(base_model_name)
+        
+        # Enhanced projection layers - deeper network for better semantic understanding
+        self.projection = nn.Sequential(
+            nn.Linear(768, 768),
+            nn.LayerNorm(768),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(768, 384),
+            nn.LayerNorm(384),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(384, 128)
+        )
+        
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        cls_output = outputs.last_hidden_state[:, 0, :]
+        projection = self.projection(cls_output)
+        projection = F.normalize(projection, p=2, dim=1)
+        return projection
+
+# Dataset class with stronger negative sampling
+class EnhancedContrastiveDataset(Dataset):
+    def __init__(self, positive_pairs, negative_pairs, tokenizer, max_length=128):
+        """
+        Initialize dataset with explicit positive and negative pairs
+        
+        Args:
+            positive_pairs: List of tuples (latin_text, ohg_text)
+            negative_pairs: List of tuples (latin_text, ohg_text)
+            tokenizer: Tokenizer for encoding texts
+            max_length: Maximum sequence length
+        """
+        self.positive_pairs = positive_pairs
+        self.negative_pairs = negative_pairs
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+    def __len__(self):
+        return len(self.positive_pairs) + len(self.negative_pairs)
+    
+    def __getitem__(self, idx):
+        # Determine if this is a positive or negative example
+        if idx < len(self.positive_pairs):
+            latin, ohg = self.positive_pairs[idx]
+            label = 1.0  # Positive pair
+        else:
+            # Adjust index for negative pairs
+            adj_idx = idx - len(self.positive_pairs)
+            latin, ohg = self.negative_pairs[adj_idx]
+            label = 0.0  # Negative pair
+        
+        latin_encoding = self.tokenizer(
+            latin, 
+            return_tensors='pt', 
+            max_length=self.max_length, 
+            padding='max_length', 
+            truncation=True
+        )
+        
+        ohg_encoding = self.tokenizer(
+            ohg, 
+            return_tensors='pt', 
+            max_length=self.max_length, 
+            padding='max_length', 
+            truncation=True
+        )
+        
+        return {
+            'latin_input_ids': latin_encoding['input_ids'].squeeze(),
+            'latin_attention_mask': latin_encoding['attention_mask'].squeeze(),
+            'ohg_input_ids': ohg_encoding['input_ids'].squeeze(),
+            'ohg_attention_mask': ohg_encoding['attention_mask'].squeeze(),
+            'label': torch.tensor(label, dtype=torch.float)
+        }
+
+# Enhanced contrastive loss with higher margin
+class StrongContrastiveLoss(nn.Module):
+    def __init__(self, margin=0.8, pos_weight=1.0, neg_weight=2.0):
+        """
+        Enhanced contrastive loss with higher margin and weighting
+        
+        Args:
+            margin: Minimum distance between positive and negative pairs (higher = stronger separation)
+            pos_weight: Weight for positive pairs
+            neg_weight: Weight for negative pairs (higher = stronger penalty)
+        """
+        super(StrongContrastiveLoss, self).__init__()
+        self.margin = margin
+        self.pos_weight = pos_weight
+        self.neg_weight = neg_weight
+        
+    def forward(self, anchor_emb, positive_emb, negative_emb=None, labels=None):
+        """
+        Compute triplet-style contrastive loss with margin
+        
+        Args:
+            anchor_emb: Latin embeddings
+            positive_emb: OHG embeddings for positive pairs (translations)
+            negative_emb: OHG embeddings for negative pairs (non-translations)
+            labels: 1 for positive pairs, 0 for negative pairs
+        """
+        if labels is not None:
+            # When using single batch with labels
+            batch_size = anchor_emb.size(0)
+            
+            # Calculate cosine similarity
+            similarity = torch.matmul(anchor_emb, positive_emb.t())
+            
+            # Extract diagonal elements (similarity between corresponding pairs)
+            pos_similarity = torch.diag(similarity)
+            
+            # Apply weights based on labels
+            pos_mask = labels > 0.5
+            neg_mask = ~pos_mask
+            
+            # Loss for positive pairs: should have high similarity
+            pos_loss = -torch.mean(pos_similarity[pos_mask]) * self.pos_weight
+            
+            # Loss for negative pairs: should have low similarity
+            neg_loss = torch.mean(torch.relu(pos_similarity[neg_mask] - (1 - self.margin))) * self.neg_weight
+            
+            return pos_loss + neg_loss
+        else:
+            # Triplet-style with separate negative embeddings
+            # Positive similarity (should be high)
+            pos_similarity = F.cosine_similarity(anchor_emb, positive_emb)
+            
+            # Negative similarity (should be low)
+            neg_similarity = F.cosine_similarity(anchor_emb, negative_emb)
+            
+            # Loss: push positive pairs together, negative pairs apart
+            loss = torch.relu(self.margin - pos_similarity + neg_similarity)
+            
+            return loss.mean()
+
+# Function to load the previously trained model
+def load_base_model(target_model):
+    """Load the previously trained model as starting point"""
+    base_model_path = os.path.join(BASE_PATH, 'contrastive_model/best_contrastive_model.pt')
+    
+    print(f"Loading base model from {base_model_path}...")
+    
+    try:
+        # Load state dict from previous model
+        state_dict = torch.load(base_model_path, map_location=device)
+        
+        # Filter out incompatible keys (due to enhanced architecture)
+        compatible_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('bert.'):
+                compatible_state_dict[k] = v
+            elif k.startswith('projection.0'):
+                compatible_state_dict[k] = v
+        
+        # Load compatible weights
+        target_model.load_state_dict(compatible_state_dict, strict=False)
+        print("Base model BERT layers loaded successfully!")
+    except Exception as e:
+        print(f"Error loading base model: {e}")
+        print("Initializing a new model...")
+    
+    return target_model
+
+# Save model function with verification
+def save_model_robust(model, path):
+    """Save model with verification"""
+    print(f"Saving model to {path}...")
+    torch.save(model.state_dict(), path)
+    
+    if os.path.exists(path):
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        print(f"✓ Model saved: {path} ({size_mb:.2f} MB)")
+        
+        # Force sync with Google Drive
+        try:
+            print("Syncing with Google Drive...")
+            drive.flush_and_unmount()
+            drive.mount('/content/drive')
+            print("Google Drive sync complete")
+            
+            # Verify file still exists
+            if os.path.exists(path):
+                print(f"✓ Verified after sync: {path}")
+                return True
+            else:
+                print(f"✗ File missing after sync: {path}")
+                return False
+        except Exception as e:
+            print(f"Drive sync warning: {e}")
+    else:
+        print(f"✗ Failed to save model: {path}")
+        return False
+
+# Function to load data from Excel files
+def load_excel_aligned_texts(excel_path, source_name):
+    """Extract parallel texts from Excel files with aligned Latin and OHG"""
+    try:
+        print(f"Loading {source_name} from {excel_path}...")
+        
+        # Read the Excel file
+        df = pd.read_excel(excel_path)
+        
+        # Use specific column names
+        latin_col = 'Source clause'
+        ohg_col = 'Target clause'
+        
+        print(f"  Using columns: '{latin_col}' (Latin) and '{ohg_col}' (OHG)")
+        
+        # Extract text pairs, skipping empty or null rows
+        latin_texts = []
+        ohg_texts = []
+        
+        for _, row in df.iterrows():
+            latin = str(row[latin_col]).strip()
+            ohg = str(row[ohg_col]).strip()
+            
+            # Skip rows where either text is empty, NaN, or \N
+            if (latin and ohg and 
+                latin != 'nan' and ohg != 'nan' and 
+                latin != '\\N' and ohg != '\\N'):
+                latin_texts.append(latin)
+                ohg_texts.append(ohg)
+        
+        print(f"  Extracted {len(latin_texts)} valid pairs from {source_name}")
+        return latin_texts, ohg_texts
+    
+    except Exception as e:
+        print(f"Error processing {source_name}: {e}")
+        return [], []
+
+# Function to generate stronger negative pairs
+def create_stronger_negative_pairs(latin_texts, ohg_texts):
+    """
+    Create more challenging negative pairs for better contrast
+    """
+    print("Creating stronger negative pairs...")
+    all_negative_pairs = []
+    n = len(latin_texts)
+    
+    # 1. Random negatives (approximately equal to positive pairs)
+    random_negative_count = n
+    
+    # Track which pairs we've already made to avoid duplicates
+    used_pairs = set()
+    for _ in range(random_negative_count):
+        idx1 = random.randint(0, n-1)
+        idx2 = random.randint(0, n-1)
+        
+        # Ensure this isn't a positive pair (aligned indices)
+        # and that we haven't already created this negative pair
+        pair_key = (idx1, idx2)
+        while idx2 == idx1 or pair_key in used_pairs:
+            idx2 = random.randint(0, n-1)
+            pair_key = (idx1, idx2)
+            
+        used_pairs.add(pair_key)
+        all_negative_pairs.append((latin_texts[idx1], ohg_texts[idx2]))
+    
+    # 2. Structure-preserving negatives (based on length similarity)
+    # Group texts by length
+    length_buckets = {}
+    for i, latin in enumerate(latin_texts):
+        length = len(latin.split())
+        if length not in length_buckets:
+            length_buckets[length] = []
+        length_buckets[length].append(i)
+    
+    # For each Latin text, find length-similar OHG text that's not its translation
+    structure_negative_count = min(n, 1000)  # Cap at 1000 examples
+    structure_negatives_added = 0
+    
+    for latin_idx in range(n):
+        if structure_negatives_added >= structure_negative_count:
+            break
+            
+        latin_length = len(latin_texts[latin_idx].split())
+        
+        # Look for length matches within ±1 word
+        potential_matches = []
+        for length in range(latin_length - 1, latin_length + 2):
+            if length in length_buckets:
+                potential_matches.extend(length_buckets[length])
+        
+        # Filter out the aligned index and previously used pairs
+        potential_matches = [idx for idx in potential_matches 
+                            if idx != latin_idx and (latin_idx, idx) not in used_pairs]
+        
+        if potential_matches:
+            ohg_idx = random.choice(potential_matches)
+            used_pairs.add((latin_idx, ohg_idx))
+            all_negative_pairs.append((latin_texts[latin_idx], ohg_texts[ohg_idx]))
+            structure_negatives_added += 1
+    
+    # 3. Adversarial negatives (shuffle words within a sentence)
+    adversarial_count = min(n // 2, 500)  # Cap at 500 examples
+    
+    for i in range(adversarial_count):
+        idx = random.randint(0, n-1)
+        
+        # Take original OHG text and shuffle its words
+        ohg_words = ohg_texts[idx].split()
+        if len(ohg_words) > 3:  # Only shuffle if there are enough words
+            random.shuffle(ohg_words)
+            shuffled_ohg = ' '.join(ohg_words)
+            
+            # Add as negative pair
+            all_negative_pairs.append((latin_texts[idx], shuffled_ohg))
+    
+    print(f"Created {len(all_negative_pairs)} negative pairs")
+    return all_negative_pairs
+
+# Enhanced training function
+def train_with_strong_negatives(model, train_loader, val_loader, epochs=5, lr=2e-5):
+    """Train with stronger emphasis on separating negative examples"""
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    
+    # Use stronger contrastive loss
+    criterion = StrongContrastiveLoss(margin=0.8, pos_weight=1.0, neg_weight=3.0)
+    
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=1, verbose=True
+    )
+    
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    
+    for epoch in range(epochs):
+        # Training
+        model.train()
+        epoch_loss = 0
+        batch_count = 0
+        
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        for batch in progress_bar:
+            latin_input_ids = batch['latin_input_ids'].to(device)
+            latin_attention_mask = batch['latin_attention_mask'].to(device)
+            ohg_input_ids = batch['ohg_input_ids'].to(device)
+            ohg_attention_mask = batch['ohg_attention_mask'].to(device)
+            labels = batch['label'].to(device)
+            
+            # Forward pass
+            latin_embeddings = model(latin_input_ids, latin_attention_mask)
+            ohg_embeddings = model(ohg_input_ids, ohg_attention_mask)
+            
+            # Compute loss
+            loss = criterion(latin_embeddings, ohg_embeddings, labels=labels)
+            
+            # Backward and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            batch_count += 1
+            
+            progress_bar.set_postfix({'loss': loss.item()})
+        
+        avg_train_loss = epoch_loss / batch_count
+        train_losses.append(avg_train_loss)
+        
+        # Validation
+        model.eval()
+        val_loss = 0
+        val_batch_count = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                latin_input_ids = batch['latin_input_ids'].to(device)
+                latin_attention_mask = batch['latin_attention_mask'].to(device)
+                ohg_input_ids = batch['ohg_input_ids'].to(device)
+                ohg_attention_mask = batch['ohg_attention_mask'].to(device)
+                labels = batch['label'].to(device)
+                
+                # Forward pass
+                latin_embeddings = model(latin_input_ids, latin_attention_mask)
+                ohg_embeddings = model(ohg_input_ids, ohg_attention_mask)
+                
+                # Compute loss
+                loss = criterion(latin_embeddings, ohg_embeddings, labels=labels)
+                val_loss += loss.item()
+                val_batch_count += 1
+        
+        avg_val_loss = val_loss / val_batch_count
+        val_losses.append(avg_val_loss)
+        
+        print(f"Epoch {epoch+1}/{epochs}, Train loss: {avg_train_loss:.4f}, Val loss: {avg_val_loss:.4f}")
+        
+        # Update learning rate based on validation loss
+        scheduler.step(avg_val_loss)
+        
+        # Save best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_path = os.path.join(MODEL_DIR, 'best_contrastive_model_enhanced.pt')
+            save_model_robust(model, best_model_path)
+            print(f"New best model saved! (Validation loss: {avg_val_loss:.4f})")
+    
+    # Save final model
+    final_model_path = os.path.join(MODEL_DIR, 'final_contrastive_model_enhanced.pt')
+    save_model_robust(model, final_model_path)
+    
+    # Plot training curve
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.legend()
+    plt.savefig(os.path.join(MODEL_DIR, 'training_curve_enhanced.png'))
+    
+    return model, train_losses, val_losses
+
+# Function to evaluate the enhanced model
+def evaluate_enhanced_model(model, tokenizer):
+    """Evaluate model on test cases, with detailed metrics"""
+    model.eval()
+    
+    # Test cases covering a range of relationships
+    test_cases = [
+        # True translation
+        {
+            "latin": "Monachorum quattuor esse genera manifestum est.",
+            "ohg": "municho fioreo uuesan chunni kund ist.",
+            "expected": "translation",
+            "relationship": "translation"
+        },
+        # Previously problematic case (unrelated but scored high)
+        {
+            "latin": "Quartum vero genus est monachorum, quod nominatur gyrovagum.",
+            "ohg": "Únz mír sâldâ fólgetôn . in állemo mînemo gûote.",
+            "expected": "unrelated",
+            "relationship": "unrelated"
+        },
+        # Another translation from Benedictine Rule
+        {
+            "latin": "Pro lege eis est desideriorum voluptas.",
+            "ohg": "Fora euu im ist kiridono uunnilust.",
+            "expected": "translation",
+            "relationship": "translation"
+        },
+        # Shuffled words (should be lower similarity)
+        {
+            "latin": "Pro lege eis est desideriorum voluptas.",
+            "ohg": "ist kiridono im Fora uunnilust euu.",
+            "expected": "unrelated",
+            "relationship": "shuffled"
+        }
+    ]
+    
+    print("\nEvaluating Enhanced Model:")
+    print("=" * 50)
+    
+    results = []
+    
+    for test in test_cases:
+        latin = test["latin"]
+        ohg = test["ohg"]
+        expected = test["expected"]
+        relationship = test["relationship"]
+        
+        # Tokenize
+        latin_encoding = tokenizer(
+            latin, 
+            return_tensors='pt', 
+            max_length=128, 
+            padding='max_length', 
+            truncation=True
+        ).to(device)
+        
+        ohg_encoding = tokenizer(
+            ohg, 
+            return_tensors='pt', 
+            max_length=128, 
+            padding='max_length', 
+            truncation=True
+        ).to(device)
+        
+        # Compute embeddings
+        with torch.no_grad():
+            latin_embedding = model(latin_encoding['input_ids'], latin_encoding['attention_mask'])
+            ohg_embedding = model(ohg_encoding['input_ids'], ohg_encoding['attention_mask'])
+        
+        # Compute similarity
+        similarity = F.cosine_similarity(latin_embedding, ohg_embedding).item()
+        
+        # Determine relationship based on higher thresholds
+        # Using higher thresholds to be more selective about translations
+        predicted = "unrelated"
+        if similarity >= 0.85:  # Higher threshold for translation
+            predicted = "translation"
+        elif similarity >= 0.70:
+            predicted = "paraphrase"
+        elif similarity >= 0.55:
+            predicted = "adaptation"
+        
+        # Store result
+        results.append({
+            "latin": latin,
+            "ohg": ohg,
+            "similarity": similarity,
+            "predicted": predicted,
+            "expected": expected,
+            "relationship": relationship,
+            "match": predicted == expected
+        })
+        
+        # Print result
+        print(f"\nTest Case ({relationship}):")
+        print(f"Latin: {latin}")
+        print(f"OHG: {ohg}")
+        print(f"Similarity: {similarity:.4f}")
+        print(f"Predicted: {predicted}")
+        print(f"Expected: {expected}")
+        print(f"Match: {'✓' if predicted == expected else '✗'}")
+    
+    # Calculate overall accuracy
+    accuracy = sum(1 for r in results if r["match"]) / len(results)
+    print("\nOverall accuracy:", f"{accuracy:.2%}")
+    
+    # Plot similarity distribution
+    plt.figure(figsize=(10, 6))
+    
+    relationship_types = ["translation", "unrelated", "shuffled"]
+    colors = ["green", "red", "orange"]
+    
+    for rtype, color in zip(relationship_types, colors):
+        similarities = [r["similarity"] for r in results if r["relationship"] == rtype]
+        if similarities:
+            plt.hist(similarities, alpha=0.7, label=rtype, color=color, bins=5)
+    
+    plt.axvline(x=0.85, color='black', linestyle='--', label='Translation threshold')
+    plt.axvline(x=0.70, color='gray', linestyle='--', label='Paraphrase threshold')
+    plt.axvline(x=0.55, color='lightgray', linestyle='--', label='Adaptation threshold')
+    
+    plt.xlabel('Similarity Score')
+    plt.ylabel('Count')
+    plt.title('Similarity Distribution by Relationship Type')
+    plt.legend()
+    plt.savefig(os.path.join(MODEL_DIR, 'similarity_distribution.png'))
+    
+    return results
+
+# Main function to run the enhanced training
+def run_enhanced_training():
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained('bert-base-multilingual-cased')
+    
+    # Initialize enhanced model
+    model = EnhancedContrastiveModel().to(device)
+    
+    # Load base model weights (where compatible)
+    model = load_base_model(model)
+    
+    # Load data from Excel files
+    tatian_latin, tatian_ohg = load_excel_aligned_texts(
+        os.path.join(DATA_DIR, 'Tatian_aligned.xlsx'), 'Tatian')
+    
+    isidor_latin, isidor_ohg = load_excel_aligned_texts(
+        os.path.join(DATA_DIR, 'Isidor_aligned.xlsx'), 'Isidor')
+    
+    physio_latin, physio_ohg = load_excel_aligned_texts(
+        os.path.join(DATA_DIR, 'Physiologus_aligned.xlsx'), 'Physiologus')
+    
+    benedict_latin, benedict_ohg = load_excel_aligned_texts(
+        os.path.join(DATA_DIR, 'Benedictine_Rule_aligned.xlsx'), 'Benedictine Rule')
+    
+    # Combine all texts
+    all_latin = tatian_latin + isidor_latin + physio_latin + benedict_latin
+    all_ohg = tatian_ohg + isidor_ohg + physio_ohg + benedict_ohg
+    
+    print(f"Total loaded: {len(all_latin)} parallel texts")
+    
+    # Create positive pairs (true translations)
+    positive_pairs = list(zip(all_latin, all_ohg))
+    
+    # Create stronger negative pairs
+    negative_pairs = create_stronger_negative_pairs(all_latin, all_ohg)
+    
+    # Split data into training and validation
+    # Split positive pairs
+    pos_split_idx = int(0.9 * len(positive_pairs))
+    train_pos_pairs = positive_pairs[:pos_split_idx]
+    val_pos_pairs = positive_pairs[pos_split_idx:]
+    
+    # Split negative pairs
+    neg_split_idx = int(0.9 * len(negative_pairs))
+    train_neg_pairs = negative_pairs[:neg_split_idx]
+    val_neg_pairs = negative_pairs[neg_split_idx:]
+    
+    print(f"Training set: {len(train_pos_pairs)} positive pairs, {len(train_neg_pairs)} negative pairs")
+    print(f"Validation set: {len(val_pos_pairs)} positive pairs, {len(val_neg_pairs)} negative pairs")
+    
+    # Create datasets with balanced sampling
+    train_dataset = EnhancedContrastiveDataset(train_pos_pairs, train_neg_pairs, tokenizer)
+    val_dataset = EnhancedContrastiveDataset(val_pos_pairs, val_neg_pairs, tokenizer)
+    
+    # Create data loaders
+    batch_size = 16 if device.type == 'cpu' else 32
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    
+    # Train the model
+    model, train_losses, val_losses = train_with_strong_negatives(
+        model, 
+        train_loader, 
+        val_loader, 
+        epochs=5
+    )
+    
+    # Evaluate the model
+    evaluation_results = evaluate_enhanced_model(model, tokenizer)
+    
+    return model, evaluation_results
+
+# Interactive testing function
+def test_interactive(model, tokenizer):
+    """Interactive testing of the model with user input"""
+    model.eval()
+    
+    print("\n=== Interactive Testing Mode ===")
+    print("Enter Latin and OHG text pairs to compute similarity")
+    print("Enter 'q' to quit")
+    
+    # Higher thresholds based on our enhanced model
+    thresholds = {
+        'translation': 0.85,
+        'paraphrase': 0.70,
+        'adaptation': 0.55
+    }
+    
+    while True:
+        print("\n")
+        latin = input("Enter Latin text: ")
+        if latin.lower() == 'q':
+            break
+        
+        ohg = input("Enter OHG text: ")
+        if ohg.lower() == 'q':
+            break
+        
+        # Tokenize
+        latin_encoding = tokenizer(
+            latin, 
+            return_tensors='pt', 
+            max_length=128, 
+            padding='max_length', 
+            truncation=True
+        ).to(device)
+        
+        ohg_encoding = tokenizer(
+            ohg, 
+            return_tensors='pt', 
+            max_length=128, 
+            padding='max_length', 
+            truncation=True
+        ).to(device)
+        
+        # Compute embeddings
+        with torch.no_grad():
+            latin_embedding = model(latin_encoding['input_ids'], latin_encoding['attention_mask'])
+            ohg_embedding = model(ohg_encoding['input_ids'], ohg_encoding['attention_mask'])
+        
+        # Compute similarity
+        similarity = F.cosine_similarity(latin_embedding, ohg_embedding).item()
+        
+        # Determine relationship based on thresholds
+        relationship = "unrelated"
+        if similarity >= thresholds['translation']:
+            relationship = "translation"
+        elif similarity >= thresholds['paraphrase']:
+            relationship = "paraphrase"
+        elif similarity >= thresholds['adaptation']:
+            relationship = "adaptation"
+        
+        print(f"Similarity: {similarity:.4f}")
+        print(f"Relationship: {relationship}")
+        print(f"Thresholds: translation ≥ {thresholds['translation']}, paraphrase ≥ {thresholds['paraphrase']}, adaptation ≥ {thresholds['adaptation']}")
+
+# Run enhanced training
+if __name__ == "__main__":
+    model, evaluation_results = run_enhanced_training()
+    
+    # Ask if user wants to test interactively
+    test_interactively = input("\nWould you like to test the model interactively? (y/n): ")
+    if test_interactively.lower() == 'y':
+        tokenizer = AutoTokenizer.from_pretrained('bert-base-multilingual-cased')
+        test_interactive(model, tokenizer)
+    
+    print("Enhanced training completed!")
